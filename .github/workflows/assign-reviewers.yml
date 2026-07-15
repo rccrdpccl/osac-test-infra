@@ -1,0 +1,46 @@
+---
+name: Assign Reviewers
+
+on:
+  workflow_call:
+    inputs:
+      reviewer-count:
+        description: "Number of reviewers to assign"
+        required: false
+        type: number
+        default: 1
+      max-files:
+        description: "Maximum number of changed files to analyze"
+        required: false
+        type: number
+        default: 50
+
+jobs:
+  assign:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout scripts
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7
+        with:
+          repository: osac-project/osac-test-infra
+          sparse-checkout: scripts/assign_reviewers.py
+          path: _test-infra
+
+      - name: Setup Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
+        with:
+          python-version: "3.13"
+
+      - name: Assign reviewers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          REVIEWER_COUNT: ${{ inputs.reviewer-count }}
+          MAX_FILES: ${{ inputs.max-files }}
+        run: python _test-infra/scripts/assign_reviewers.py
