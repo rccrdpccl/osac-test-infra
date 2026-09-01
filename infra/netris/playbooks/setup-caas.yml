@@ -1,7 +1,6 @@
 ---
-- name: Set up CaaS — discover hosts, label agents, register host type
+- name: Set up CaaS — publish cluster templates and create catalog items
   hosts: all
   gather_facts: false
   roles:
-    - discover-caas
     - setup-caas
