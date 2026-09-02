@@ -170,8 +170,9 @@ prep-osac:
 run-osac-setup:
 	@echo "=== Installing OSAC via Helm (make install) ==="
 	cd /opt/osac/osac-installer && make install \
-		INSTALLER_NAMESPACE=$(OSAC_NAMESPACE) \
-		VALUES_FILE=$(OSAC_VALUES_FILE)
+		PLATFORM=openshift \
+		PROFILE=caas-ci \
+		NS=$(OSAC_NAMESPACE)
 
 post-osac:
 	ansible-playbook playbooks/post-osac.yml $(ANSIBLE_EXTRA)
