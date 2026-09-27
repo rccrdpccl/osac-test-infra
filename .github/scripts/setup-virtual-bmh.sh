@@ -21,15 +21,101 @@ set -euo pipefail
 : "${CLONE_NAME:?CLONE_NAME is required}"
 : "${KUBECONFIG:?KUBECONFIG is required}"
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=.github/scripts/virtual-bmh-disk.sh
+source "${SCRIPT_DIR}/virtual-bmh-disk.sh"
+
 BMH_NAMESPACE="${BMH_NAMESPACE:-host-inventory}"
 BMH_COUNT="${BMH_COUNT:-2}"
 SUSHY_PORT="${SUSHY_PORT:-8000}"
 SUSHY_CONFIG_DIR="${HOME}/sushy-${CLONE_NAME}"
 SUSHY_PID_FILE="${SUSHY_CONFIG_DIR}/sushy.pid"
+SUSHY_VMEDIA_TMP="${HOME}/sushy-vmedia-tmp-${CLONE_NAME}"
 CT_NETWORK="test-infra-net-${CLONE_NAME}"
-VIRSH="virsh -c qemu:///system"
+VIRSH=(virsh -c qemu:///system)
 VM_DISK_DIR="/tmp/virtual-bmh-disks-${CLONE_NAME}"
 POOL_NAME="bmh-${CLONE_NAME}"
+# Assisted requires at least 100 GB; provision 120 GiB for installation headroom.
+readonly BMH_DISK_SIZE=120G
+readonly BMH_DISK_CAPACITY_BYTES=$((120 * 1024 * 1024 * 1024))
+
+preflight_fresh_bmh_resources() {
+  local -a conflicts=()
+  local all_vm_names
+  local pool_names
+  local namespace_name
+  local bmh_crd
+  local resource_name
+  local resource_output
+  local vm_name
+  local path
+  local i
+
+  for path in "${VM_DISK_DIR}" "${SUSHY_CONFIG_DIR}" "${SUSHY_VMEDIA_TMP}"; do
+    if [[ -e "${path}" || -L "${path}" ]]; then
+      conflicts+=("path ${path}")
+    fi
+  done
+
+  if ! pool_names=$("${VIRSH[@]}" pool-list --all --name); then
+    printf 'ERROR: unable to list libvirt storage pools; refusing BMH setup\n' >&2
+    return 1
+  fi
+  if grep -Fxq "${POOL_NAME}" <<< "${pool_names}"; then
+    conflicts+=("libvirt pool ${POOL_NAME}")
+  fi
+
+  if ! all_vm_names=$("${VIRSH[@]}" list --all --name); then
+    printf 'ERROR: unable to list libvirt VMs; refusing BMH setup\n' >&2
+    return 1
+  fi
+  while IFS= read -r vm_name; do
+    if [[ "${vm_name}" == virtual-bmh-* ]]; then
+      conflicts+=("libvirt VM ${vm_name}")
+    fi
+  done <<< "${all_vm_names}"
+
+  if ! namespace_name=$(oc get namespace "${BMH_NAMESPACE}" --ignore-not-found -o name); then
+    printf 'ERROR: unable to inspect namespace %s; refusing BMH setup\n' "${BMH_NAMESPACE}" >&2
+    return 1
+  fi
+  if [[ -n "${namespace_name}" ]]; then
+    if ! resource_output=$(oc get secrets -n "${BMH_NAMESPACE}" -o name); then
+      printf 'ERROR: unable to list secrets in namespace %s; refusing BMH setup\n' "${BMH_NAMESPACE}" >&2
+      return 1
+    fi
+    while IFS= read -r resource_name; do
+      if [[ "${resource_name##*/}" == virtual-bmh-* ]]; then
+        conflicts+=("${resource_name} in namespace ${BMH_NAMESPACE}")
+      fi
+    done <<< "${resource_output}"
+
+    if ! bmh_crd=$(oc get crd baremetalhosts.metal3.io --ignore-not-found -o name); then
+      printf 'ERROR: unable to inspect the BareMetalHost CRD; refusing BMH setup\n' >&2
+      return 1
+    fi
+    if [[ -n "${bmh_crd}" ]]; then
+      if ! resource_output=$(oc get bmh -n "${BMH_NAMESPACE}" -o name); then
+        printf 'ERROR: unable to list BareMetalHosts in namespace %s; refusing BMH setup\n' "${BMH_NAMESPACE}" >&2
+        return 1
+      fi
+      while IFS= read -r resource_name; do
+        if [[ "${resource_name##*/}" == virtual-bmh-* ]]; then
+          conflicts+=("${resource_name} in namespace ${BMH_NAMESPACE}")
+        fi
+      done <<< "${resource_output}"
+    fi
+  fi
+
+  if (( ${#conflicts[@]} > 0 )); then
+    printf 'ERROR: refusing to reuse existing virtual BMH resources:\n' >&2
+    printf '  - %s\n' "${conflicts[@]}" >&2
+    printf 'No cleanup was attempted. Use separately confirmed teardown, then provision with a fresh clone name.\n' >&2
+    return 1
+  fi
+}
+
+preflight_fresh_bmh_resources
 
 # --- Step 1: Activate Ironic via Provisioning CR ---
 echo "==> Activating Ironic (Provisioning CR)..."
@@ -55,14 +141,14 @@ echo "Ironic is active."
 
 # --- Step 2: Discover network and gateway IP ---
 echo "==> Discovering cluster-tool network..."
-if ! ${VIRSH} net-info "${CT_NETWORK}" &>/dev/null; then
+if ! "${VIRSH[@]}" net-info "${CT_NETWORK}" &>/dev/null; then
   echo "ERROR: libvirt network '${CT_NETWORK}' not found." >&2
   echo "Available networks:" >&2
-  ${VIRSH} net-list --all >&2
+  "${VIRSH[@]}" net-list --all >&2
   exit 1
 fi
 
-GW_IP=$(${VIRSH} net-dumpxml "${CT_NETWORK}" | python3 -c "
+GW_IP=$("${VIRSH[@]}" net-dumpxml "${CT_NETWORK}" | python3 -c "
 import sys, xml.etree.ElementTree as ET
 root = ET.parse(sys.stdin).getroot()
 print(root.find('.//ip').get('address'))
@@ -73,8 +159,8 @@ echo "Gateway IP (host): ${GW_IP}"
 echo "==> Creating libvirt storage pool '${POOL_NAME}'..."
 mkdir -p "${VM_DISK_DIR}"
 chmod 777 "${VM_DISK_DIR}"
-${VIRSH} pool-define-as "${POOL_NAME}" dir --target "${VM_DISK_DIR}"
-${VIRSH} pool-start "${POOL_NAME}"
+"${VIRSH[@]}" pool-define-as "${POOL_NAME}" dir --target "${VM_DISK_DIR}"
+"${VIRSH[@]}" pool-start "${POOL_NAME}"
 
 # --- Step 4: Install and start sushy-tools ---
 echo "==> Installing sushy-tools..."
@@ -105,7 +191,6 @@ SEOF
 # TMPDIR. Pointing TMPDIR at a directory named for this job means the
 # cache lives somewhere teardown.sh can remove deterministically by name,
 # instead of having to guess which /tmp/tmpXXXXXXXX dirs are its.
-export SUSHY_VMEDIA_TMP="${HOME}/sushy-vmedia-tmp-${CLONE_NAME}"
 mkdir -p "${SUSHY_VMEDIA_TMP}"
 export TMPDIR="${SUSHY_VMEDIA_TMP}"
 
@@ -166,12 +251,12 @@ for i in $(seq 1 "${BMH_COUNT}"); do
   VARS_PATH="${VM_DISK_DIR}/${VM_NAME}-VARS.fd"
 
   echo "  Creating VM: ${VM_NAME} (MAC: ${MAC})..."
-  qemu-img create -f qcow2 "${DISK_PATH}" 50G
+  qemu-img create -f qcow2 "${DISK_PATH}" "${BMH_DISK_SIZE}"
   cp "${OVMF_VARS}" "${VARS_PATH}"
 
   # libvirt 10.10+: firmware='efi' plus explicit <loader>/<nvram> fails with
   # "Unable to find 'efi' firmware". The pflash paths already select UEFI.
-  ${VIRSH} define /dev/stdin <<VMXML
+  "${VIRSH[@]}" define /dev/stdin <<VMXML
 <domain type='kvm'>
   <name>${VM_NAME}</name>
   <memory unit='MiB'>8192</memory>
@@ -205,7 +290,8 @@ for i in $(seq 1 "${BMH_COUNT}"); do
 </domain>
 VMXML
 
-  ${VIRSH} start "${VM_NAME}"
+  "${VIRSH[@]}" start "${VM_NAME}"
+  verify_virtual_bmh_disk "${VM_NAME}" "${DISK_PATH}" "${BMH_DISK_CAPACITY_BYTES}"
   VM_NAMES="${VM_NAMES:+${VM_NAMES} }${VM_NAME}"
 done
 
@@ -252,7 +338,7 @@ i=0
 for VM_NAME in ${VM_NAMES}; do
   i=$((i + 1))
   MAC="52:54:00:bb:cc:$(printf '%02x' "${i}")"
-  VM_UUID=$(${VIRSH} domuuid "${VM_NAME}")
+  VM_UUID=$("${VIRSH[@]}" domuuid "${VM_NAME}")
 
   echo "  ${VM_NAME}: UUID=${VM_UUID}, MAC=${MAC}"
 
